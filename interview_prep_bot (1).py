@@ -4,24 +4,32 @@ Resume Interview Prep Bot  (LangChain + Gemini + Streamlit)
 Upload your resume PDF + paste a job description.
 The app generates tailored interview questions and tips.
 
-Setup:
-    pip install langchain langchain-community langchain-google-genai pypdf streamlit
-    set GOOGLE_API_KEY=your_key      (Windows)   |   export GOOGLE_API_KEY=your_key  (Linux/Mac)
+Python 3.15 notes:
+  - Uses only pure-Python code on our side; no temp files, no langchain-community.
+  - PDF reading uses pypdf directly (pure Python), which avoids a heavy dependency.
+
+Setup (use a fresh virtual environment):
+    python3.15 -m venv .venv
+    source .venv/bin/activate            (Windows: .venv\\Scripts\\activate)
+    pip install -U pip
+    pip install -U langchain-core langchain-google-genai pypdf streamlit
+    export GOOGLE_API_KEY=your_key       (Windows: set GOOGLE_API_KEY=your_key)
     streamlit run interview_prep_bot.py
 """
 
-import tempfile
+import os
+from io import BytesIO
 
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
+from pypdf import PdfReader
 
 # Change to whichever Gemini model is current in Google AI Studio
 MODEL_NAME = "gemini-2.5-flash"
 
-prompt = ChatPromptTemplate.from_messages([
+PROMPT = ChatPromptTemplate.from_messages([
     ("system",
      "You are a strict but helpful technical interviewer for SDE roles. "
      "Use ONLY the resume and job description provided."),
@@ -34,23 +42,53 @@ prompt = ChatPromptTemplate.from_messages([
      "4. Top 3 skill gaps between resume and job description, with what to study\n"),
 ])
 
-# LCEL chain: prompt -> model -> plain text
-chain = prompt | ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0.4) | StrOutputParser()
+
+@st.cache_resource
+def get_chain():
+    """Build the LCEL chain once: prompt -> model -> plain text."""
+    llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0.4)
+    return PROMPT | llm | StrOutputParser()
 
 
 def load_pdf_text(uploaded_file) -> str:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_file.read())
-        path = tmp.name
-    pages = PyPDFLoader(path).load()
-    return "\n".join(p.page_content for p in pages)
+    """Extract text from an uploaded PDF fully in memory."""
+    reader = PdfReader(BytesIO(uploaded_file.getvalue()))
+    return "\n".join((page.extract_text() or "") for page in reader.pages).strip()
 
 
-st.title("Resume Interview Prep Bot")
-pdf = st.file_uploader("Upload your resume (PDF)", type="pdf")
-jd = st.text_area("Paste the job description", height=200)
+def main() -> None:
+    st.title("Resume Interview Prep Bot")
 
-if st.button("Generate questions") and pdf and jd.strip():
-    with st.spinner("Thinking..."):
-        resume_text = load_pdf_text(pdf)
-        st.markdown(chain.invoke({"resume": resume_text, "jd": jd}))
+    if not os.environ.get("GOOGLE_API_KEY"):
+        st.error("GOOGLE_API_KEY is not set. Set it and restart the app.")
+        st.stop()
+
+    pdf = st.file_uploader("Upload your resume (PDF)", type="pdf")
+    jd = st.text_area("Paste the job description", height=200)
+
+    if st.button("Generate questions"):
+        if not pdf or not jd.strip():
+            st.warning("Please upload a resume PDF and paste a job description.")
+            return
+
+        with st.spinner("Thinking..."):
+            resume_text = load_pdf_text(pdf)
+            if not resume_text:
+                st.error(
+                    "No text found in this PDF (it may be a scanned image). "
+                    "Please upload a text-based PDF."
+                )
+                return
+            try:
+                result = get_chain().invoke({"resume": resume_text, "jd": jd})
+            except Exception as exc:  # network / quota / bad key
+                st.error(f"Generation failed: {exc}")
+                return
+        st.markdown(result)
+
+
+if __name__ == "__main__":
+    main()
+else:
+    # Streamlit executes the script as a module, so run the UI directly.
+    main()
